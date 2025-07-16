@@ -29,10 +29,10 @@ SOLAR_WORKFLOW
 '''
 
 
-def solar_workflow(date, region, var, tilt):
+def solar_workflow(date, region, tilt):
     ds = read_data(date, region)
-    solar = clear_sky_performance(ds, var, tilt)
-    save_timeseries(solar, date, region, var)
+    solar = clear_sky_performance(ds, tilt)
+    save_timeseries(solar, date, region)
     del ds, solar
     LOG.info('END OF SOLAR_WORKFLOW')
     return
@@ -125,7 +125,7 @@ def get_region(region):
             return gdf
         else:
             return gdf[gdf["Name"].str.startswith(region_name)]
-    # GET CITY REGION GOES HERE
+    
     if region_type == 'GCCSA':
         shapefile = '/home/548/cd3022/aus-historical-solar-droughts/data/boundary_files/GCCSA/GCCSA_2021_AUST_GDA2020.shp'
         gdf = gpd.read_file(shapefile)
@@ -138,7 +138,7 @@ def get_region(region):
         LOG.info(f'unsuported region type "{region_type}" supplied')
         return
 
-def clear_sky_performance(ds, var, tilt):
+def clear_sky_performance(ds, tilt):
 
     LOG.info('reading dataset variables')
     ghi = ds.surface_global_irradiance.values.ravel()
@@ -162,16 +162,17 @@ def clear_sky_performance(ds, var, tilt):
     lon_1d_expanded_clean = lon_1d_expanded[~nan_mask]
     time_1d_clean = time_1d[~nan_mask]
 
-    # ERA5 temperature data
-    LOG.info('getting ERA5 temperature')
+    # BARRA-R2 temperature data
+    LOG.info('getting BARRA-R2 temperature')
     year = pd.to_datetime(ds.isel(time=50).time.values.item()).year
     month = pd.to_datetime(ds.isel(time=50).time.values.item()).month
-    era5_dirs = [Path(f"/g/data/rt52/era5/single-levels/reanalysis/2t/{year}")]
-    era5_file = [f for d in era5_dirs for f in d.glob(f"2t_era5_oper_sfc_{year}{month:02d}*.nc")][0]
-    era5 = xr.open_dataset(
-        era5_file,
+
+    barra_file = f'/g/data/ob53/BARRA2/output/reanalysis/AUS-11/BOM/ERA5/historical/hres/BARRA-R2/v1/1hr/tas/latest/tas_AUS-11_ERA5_historical_hres_BOM_BARRA-R2_v1_1hr_{year}{month:02d}-{year}{month:02d}.nc'
+    barra = xr.open_dataset(
+        barra_file,
         engine='h5netcdf'
     )
+    LOG.info('BARRA file opened')
     points = xr.Dataset(
         {
             "latitude": ("points", lat_1d_expanded_clean),
@@ -179,26 +180,17 @@ def clear_sky_performance(ds, var, tilt):
             "time": ("points", time_1d_clean),
         }
     )
-    temp_era5 = era5["t2m"].sel(
-        latitude=points["latitude"],
-        longitude=points["longitude"],
+    temp_barra = barra["tas"].sel(
+        lat=points["latitude"],
+        lon=points["longitude"],
         time=points["time"],
         method="nearest"
     )
-    temp_clean = temp_era5.values - 273.15
-
-    LOG.info("INPUTS INTO SOLAR_PV_GENERATION")
-    LOG.info(f"GHI: {ghi_clean.shape}")
-    LOG.info(f"DNI: {dni_clean.shape}")
-    LOG.info(f"DHI: {dhi_clean.shape}")
-    LOG.info(f"time: {time_1d_clean.shape}")
-    LOG.info(f"lat: {lat_1d_expanded_clean.shape}")
-    LOG.info(f"lon: {lon_1d_expanded_clean.shape}")
-    LOG.info(f"temp: {temp_clean.shape}")
+    temp_clean = temp_barra.values - 273.15
 
     # calculate capacity factors using pvlib
     LOG.info(f'running pvlib functions')
-    solar_output = solar_pv_generation(
+    actual, ideal = solar_pv_generation(
         pv_model = 'Canadian_Solar_CS5P_220M___2009_',
         inverter_model = 'ABB__MICRO_0_25_I_OUTD_US_208__208V_',
         ghi=ghi_clean,
@@ -208,30 +200,43 @@ def clear_sky_performance(ds, var, tilt):
         lat=lat_1d_expanded_clean,
         lon=lon_1d_expanded_clean,
         temp=temp_clean,
-        var=var,
         tilt=tilt
     )
-    
+
     mask_template = ds.surface_global_irradiance
-    filled = np.empty_like(ghi)
-    filled[nan_mask] = np.nan
-    filled[~nan_mask] = solar_output
-    reshaped = filled.reshape(mask_template.shape)
+    actual_filled = np.empty_like(ghi)
+    ideal_filled = np.empty_like(ghi)
+
+    actual_filled[nan_mask] = np.nan
+    actual_filled[~nan_mask] = actual
+
+    ideal_filled[nan_mask] = np.nan
+    ideal_filled[~nan_mask] = ideal
+
+    actual_reshaped = actual_filled.reshape(mask_template.shape)
+    ideal_reshaped = ideal_filled.reshape(mask_template.shape)
     
-    return xr.DataArray(reshaped, coords=mask_template.coords, dims=mask_template.dims)
+    return xr.Dataset(
+        data_vars={
+            "actual": (mask_template.dims, actual_reshaped),
+            "ideal": (mask_template.dims, ideal_reshaped)
+        },
+        coords=mask_template.coords,
+        )
+
 
     
-def save_timeseries(da, date, region, var):
+def save_timeseries(ds, date, region):
 
     region_type, region_name = region.split('_')
 
-    nem_timeseries = da.mean(dim=["latitude", "longitude"], skipna=True)
+    nem_timeseries = ds.mean(dim=["latitude", "longitude"], skipna=True)
     year=date[:4]
     month=date[5:7]
     day=date[8:10]
 
     file_name = f'{region_name}_timeseries_{year}-{month}-{day}.nc'
-    file_path = f'/g/data/gb02/cd3022/hot-and-cloudy/solar-pv/{region_type}/{var}/{region_name}/{year}/{month}/'
+    file_path = f'/g/data/gb02/cd3022/hot-and-cloudy/solar-pv/{region_type}/{region_name}/{year}/{month}/'
     
     os.makedirs(file_path, exist_ok=True)
     LOG.info(f'Writing data to: {file_path}/{file_name}')
@@ -249,19 +254,14 @@ def solar_pv_generation(
     ghi,
     dhi,
     temp,
-    var,
     tilt
 ):
     '''
     Other than pv and inverter models, all other arguments must be a flat 1D array of equal size
     '''
-    if var not in ['ideal', 'actual']:
-        LOG.info(f'Unrecognised var: {var}. Var must be "ideal" or "actual"')
-        return 'WRONG VAR'
 
     if tilt not in ['fixed', 'single_axis']:
-        LOG.info(f'Unrecognised panel tilt: {tilt}. Tilt must be "fixed" or "single_axis"')
-        return 'WRONG TILT'
+        raise ValueError(f'Unrecognised tilt: {tilt}. tilt must be "fixed" or "single_axis"')
     
     # get the module and inverter specifications from SAM
     sandia_modules = pvlib.pvsystem.retrieve_sam('SandiaMod')
@@ -298,7 +298,6 @@ def solar_pv_generation(
             solar_zenith=solpos["apparent_zenith"],
             solar_azimuth=solpos["azimuth"],
         )
-    LOG.info(f'Solar angles retrieved for: {tilt}')
 
     # compute airmass data
     airmass_relative = pvlib.atmosphere.get_relative_airmass(
@@ -326,7 +325,6 @@ def solar_pv_generation(
         aoi=aoi,
         module=module,
     )
-    LOG.info(f'Actual irradiance calculated')
 
     # compute ideal conditions
     linke_turbidity = np.maximum(2 + 0.1 * airmass_absolute, 2.5)
@@ -356,8 +354,6 @@ def solar_pv_generation(
         module=module,
     )
 
-    LOG.info(f'Ideal irradiance calculated')
-
     # Compute power outputs
     dc = pvlib.pvsystem.sapm(
         effective_irradiance=effective_irradiance.values,
@@ -371,6 +367,7 @@ def solar_pv_generation(
         inverter=inverter
     )
     ac_QC = np.where(ac < 0, np.nan, ac)
+    
     # ideal power output
     dc_ideal = pvlib.pvsystem.sapm(
         effective_irradiance=ideal_effective_irradiance.values,
@@ -383,9 +380,6 @@ def solar_pv_generation(
         inverter=inverter
     )
     ac_ideal_QC = np.where(ac_ideal < 0, np.nan, ac_ideal)
-    LOG.info(f'Power output calculated')
-    if var == 'ideal':
-        return ac_ideal_QC
-    if var == 'actual':
-        return ac_QC 
+
+    return ac_QC, ac_ideal_QC
         
